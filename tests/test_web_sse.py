@@ -210,6 +210,9 @@ def test_search_endpoint_sets_csp_header(tmp_db, corpus):
         resp.read()
         conn.close()
     assert "default-src 'none'" in csp
+    # connect-src 'self' is required so the in-page fetch('/dirs') and the
+    # SSE EventSource('/stream') aren't blocked by the default-src 'none'.
+    assert "connect-src 'self'" in csp
 
 
 # --- auth gate --------------------------------------------------------------

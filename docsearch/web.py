@@ -4,6 +4,7 @@ Architecture:
   GET /          → renders shell + indexed results (instant FTS5 query).
   GET /stream    → SSE: walks unindexed files, extracts in a thread pool,
                    streams matches as `result` events, persists to the index.
+  GET /dirs      → JSON listing of one directory level (lazy folder picker).
   GET /open      → opens a hit file in the system viewer.
 """
 import hmac
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import threading
 import urllib.parse
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +29,97 @@ from .config import load_config
 MAX_EXTRACTORS = 4
 SESSION_COOKIE = "docsearch_session"
 AUTH_TOKEN_FILENAME = "auth-token"
+
+# Hard caps for the folder-picker so a pathological directory can never DoS us.
+MAX_DIR_CHILDREN = 5000     # subfolders shown per /dirs call
+MAX_FOLDER_SELECTIONS = 200  # selected folders accepted per search
+
+
+def _normpath(p: str) -> str:
+    """Expanduser + normpath. Lexical only — does NOT follow symlinks. We
+    rely on this both for the auth check (a `..`-laden path normalizes to a
+    form that no longer starts with an authorized root) and for prefix
+    matching against indexed paths (which are stored without resolution)."""
+    return os.path.normpath(os.path.expanduser(p))
+
+
+def _path_under(child: str, parent: str) -> bool:
+    """True iff `child` equals `parent` or is a descendant. Both must already
+    be normalized. Uses os.sep boundary so /foo doesn't match /foobar."""
+    return child == parent or child.startswith(parent + os.sep)
+
+
+def _resolve_within_roots(path_str: str, roots: list[str]) -> Path | None:
+    """Return the normalized Path iff it points at an existing directory that
+    lies inside one of the configured `roots`. Otherwise None. Purely
+    lexical — does not follow symlinks, so loops/escapes via symlink can't
+    bypass the check."""
+    if not path_str:
+        return None
+    norm = _normpath(path_str)
+    for r in roots:
+        if _path_under(norm, _normpath(r)):
+            p = Path(norm)
+            # is_dir() does follow symlinks, but that's OK here: we only use
+            # this to display children, never to recurse, and the lexical
+            # prefix check above already prevented escape.
+            if p.is_dir():
+                return p
+            return None
+    return None
+
+
+def _dedupe_descendants(paths: Iterable[str]) -> list[str]:
+    """Drop any path whose ancestor is already in the set. Parent wins.
+    Inputs must already be normalized. Output is sorted lexicographically
+    and capped at MAX_FOLDER_SELECTIONS."""
+    unique = sorted(set(paths))
+    out: list[str] = []
+    for p in unique:
+        if any(_path_under(p, o) for o in out):
+            continue
+        out.append(p)
+        if len(out) >= MAX_FOLDER_SELECTIONS:
+            break
+    return out
+
+
+def _parse_folders_param(raw: str, configured: list[str]) -> tuple[list[str], bool]:
+    """Parse the `folders` query param (newline-separated absolute paths).
+    Returns (effective_folders, is_filtered):
+      - is_filtered=False → no valid selection given; use all configured folders.
+      - is_filtered=True  → restrict to the returned list.
+    Selections outside the configured roots are silently dropped (defensive —
+    /dirs can't produce them, but a hand-crafted URL might)."""
+    if not raw:
+        return list(configured), False
+    requested = [s for s in (line.strip() for line in raw.replace(",", "\n").splitlines()) if s]
+    valid: list[str] = []
+    for r in requested:
+        norm = _normpath(r)
+        if any(_path_under(norm, _normpath(c)) for c in configured):
+            valid.append(norm)
+    if not valid:
+        return list(configured), False
+    return _dedupe_descendants(valid), True
+
+
+def _has_dir_child(path: Path) -> bool:
+    """Cheap probe: does `path` contain at least one non-hidden subdirectory?
+    Uses follow_symlinks=False to avoid traversing into symlink loops."""
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return False
 
 PAGE = """<!doctype html>
 <html lang="en">
@@ -86,12 +179,31 @@ PAGE = """<!doctype html>
   .more {{ color: var(--muted); font-size: 0.85em; padding-left: 14px;
            font-family: -apple-system, sans-serif; }}
   .empty {{ color: var(--muted); padding: 40px 0; text-align: center; font-size: 1.05em; }}
+  .folder-summary {{ color: var(--muted); font-size: 0.85em; margin-top: 8px;
+                     font-family: -apple-system, sans-serif; }}
+  .folder-summary a {{ color: var(--link); }}
+  .folder-panel {{ margin-top: 12px; padding: 12px; border: 1px solid var(--rule);
+                   border-radius: 2px; background: #fbfbfd;
+                   font-family: -apple-system, sans-serif; font-size: 0.92em; }}
+  .folder-panel[hidden] {{ display: none; }}
+  .folder-panel .actions {{ margin-top: 10px; display: flex; gap: 8px; }}
+  .folder-tree {{ list-style: none; padding: 0; margin: 0; max-height: 340px;
+                  overflow-y: auto; }}
+  .folder-tree ul {{ list-style: none; padding-left: 18px; margin: 0; }}
+  .tree-row {{ display: flex; align-items: center; gap: 6px; padding: 2px 0;
+               line-height: 1.5; }}
+  .tree-toggle {{ display: inline-block; width: 14px; text-align: center;
+                  color: var(--muted); user-select: none; }}
+  .tree-label {{ word-break: break-all; }}
+  .tree-empty {{ color: var(--muted); font-style: italic; padding: 2px 0 2px 20px; }}
+  .tree-error {{ color: #b32424; padding: 2px 0 2px 20px; }}
+  .tree-truncated {{ color: var(--muted); padding: 2px 0 2px 20px; }}
 </style>
 </head>
 <body>
 <header>
   <h1><a href="/">docsearch</a></h1>
-  <form method="get" action="/">
+  <form method="get" action="/" id="search-form">
     <input type="text" name="q" value="{q_attr}" placeholder="Search your documents…" autofocus>
     <select name="mode" aria-label="Match mode">
       <option value="all"{mode_all_sel}>all words</option>
@@ -101,13 +213,213 @@ PAGE = """<!doctype html>
     <select name="types" aria-label="File type">
       {types_options}
     </select>
+    <button type="button" id="folders-btn" aria-expanded="false">Folders…</button>
+    <input type="hidden" name="folders" id="folders-input" value="{folders_attr}">
     <button type="submit">Search</button>
   </form>
+  <div class="folder-summary" id="folder-summary">{folders_summary}</div>
+  <div class="folder-panel" id="folder-panel" hidden>
+    <ul class="folder-tree" id="folder-tree"><li class="tree-empty">Loading…</li></ul>
+    <div class="actions">
+      <button type="button" id="folders-apply">Apply</button>
+      <button type="button" id="folders-clear">Clear (search all)</button>
+      <button type="button" id="folders-close">Close</button>
+    </div>
+  </div>
 </header>
 {body}
+{folder_picker_script}
 {stream_script}
 </body>
 </html>
+"""
+
+FOLDER_PICKER_SCRIPT = """
+<script>
+(function() {
+  const btn = document.getElementById('folders-btn');
+  const panel = document.getElementById('folder-panel');
+  const tree = document.getElementById('folder-tree');
+  const input = document.getElementById('folders-input');
+  const form = document.getElementById('search-form');
+  const applyBtn = document.getElementById('folders-apply');
+  const clearBtn = document.getElementById('folders-clear');
+  const closeBtn = document.getElementById('folders-close');
+  const resetLink = document.getElementById('folders-reset');
+  if (!btn || !panel || !tree || !input || !form) return;
+
+  let loaded = false;
+  // Bound concurrent /dirs requests so a frustrated user can't open
+  // hundreds of nodes at once. Each row also disables its toggle while
+  // its request is in flight to prevent re-entry.
+  let inFlight = 0;
+  const MAX_INFLIGHT = 8;
+
+  function setPanelOpen(open) {
+    panel.hidden = !open;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open && !loaded) {
+      loaded = true;
+      loadInto(tree, '');
+    }
+  }
+
+  function makeNode(child) {
+    const li = document.createElement('li');
+    li.dataset.path = child.path;
+    const row = document.createElement('div');
+    row.className = 'tree-row';
+
+    const toggle = document.createElement('span');
+    toggle.className = 'tree-toggle';
+    if (child.has_children) {
+      toggle.textContent = '\\u25B8';
+      toggle.style.cursor = 'pointer';
+      toggle.addEventListener('click', () => toggleNode(li, toggle));
+    } else {
+      toggle.textContent = '\\u00A0';
+    }
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'tree-check';
+
+    const label = document.createElement('span');
+    label.className = 'tree-label';
+    label.textContent = child.name;
+    if (child.has_children) {
+      label.style.cursor = 'pointer';
+      label.addEventListener('click', () => toggleNode(li, toggle));
+    }
+
+    row.appendChild(toggle);
+    row.appendChild(checkbox);
+    row.appendChild(label);
+    li.appendChild(row);
+    return li;
+  }
+
+  function loadInto(container, path) {
+    if (inFlight >= MAX_INFLIGHT) return;
+    inFlight++;
+    fetch('/dirs?path=' + encodeURIComponent(path), {credentials: 'same-origin'})
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+      .then(data => {
+        container.innerHTML = '';
+        if (!data.children || data.children.length === 0) {
+          const li = document.createElement('li');
+          li.className = 'tree-empty';
+          li.textContent = '(no subfolders)';
+          container.appendChild(li);
+          return;
+        }
+        for (const c of data.children) container.appendChild(makeNode(c));
+        if (data.truncated) {
+          const li = document.createElement('li');
+          li.className = 'tree-truncated';
+          li.textContent = '(too many subfolders to show — refine first)';
+          container.appendChild(li);
+        }
+      })
+      .catch(err => {
+        container.innerHTML = '';
+        const li = document.createElement('li');
+        li.className = 'tree-error';
+        li.textContent = 'failed to load: ' + err.message;
+        container.appendChild(li);
+      })
+      .finally(() => { inFlight--; });
+  }
+
+  function toggleNode(li, toggle) {
+    const existing = li.querySelector(':scope > ul');
+    if (existing) {
+      existing.remove();
+      toggle.textContent = '\\u25B8';
+      return;
+    }
+    if (toggle.dataset.loading === '1') return;
+    toggle.dataset.loading = '1';
+    toggle.textContent = '\\u25BE';
+    const ul = document.createElement('ul');
+    const placeholder = document.createElement('li');
+    placeholder.className = 'tree-empty';
+    placeholder.textContent = 'Loading…';
+    ul.appendChild(placeholder);
+    li.appendChild(ul);
+    // Inline loader so we can re-target this exact ul.
+    if (inFlight >= MAX_INFLIGHT) {
+      ul.innerHTML = '<li class="tree-error">too many open requests — wait a moment</li>';
+      toggle.dataset.loading = '';
+      toggle.textContent = '\\u25B8';
+      ul.remove();
+      return;
+    }
+    inFlight++;
+    fetch('/dirs?path=' + encodeURIComponent(li.dataset.path), {credentials: 'same-origin'})
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+      .then(data => {
+        ul.innerHTML = '';
+        if (!data.children || data.children.length === 0) {
+          ul.innerHTML = '<li class="tree-empty">(no subfolders)</li>';
+          return;
+        }
+        for (const c of data.children) ul.appendChild(makeNode(c));
+        if (data.truncated) {
+          const trunc = document.createElement('li');
+          trunc.className = 'tree-truncated';
+          trunc.textContent = '(too many subfolders to show — refine first)';
+          ul.appendChild(trunc);
+        }
+      })
+      .catch(err => {
+        ul.innerHTML = '<li class="tree-error">failed to load: ' + err.message + '</li>';
+        toggle.textContent = '\\u25B8';
+      })
+      .finally(() => {
+        inFlight--;
+        toggle.dataset.loading = '';
+      });
+  }
+
+  function collectChecked() {
+    const checks = tree.querySelectorAll('input.tree-check:checked');
+    const paths = [];
+    checks.forEach(c => {
+      const li = c.closest('li');
+      if (li && li.dataset.path) paths.push(li.dataset.path);
+    });
+    // parent-wins dedupe so a redundant child selection collapses up.
+    paths.sort();
+    const kept = [];
+    const sep = '/';
+    for (const p of paths) {
+      if (kept.some(k => p === k || p.startsWith(k + sep))) continue;
+      kept.push(p);
+    }
+    return kept;
+  }
+
+  btn.addEventListener('click', () => setPanelOpen(panel.hidden));
+  closeBtn.addEventListener('click', () => setPanelOpen(false));
+  applyBtn.addEventListener('click', () => {
+    const kept = collectChecked();
+    input.value = kept.join('\\n');
+    form.submit();
+  });
+  clearBtn.addEventListener('click', () => {
+    input.value = '';
+    form.submit();
+  });
+  if (resetLink) {
+    resetLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      input.value = '';
+      form.submit();
+    });
+  }
+})();
+</script>
 """
 
 STREAM_SCRIPT_TPL = """
@@ -115,9 +427,11 @@ STREAM_SCRIPT_TPL = """
 (function() {{
   const q = {q_json};
   const types = {types_json};
+  const folders = {folders_json};
   const mode = {mode_json};
   const limit = {limit};
   const params = new URLSearchParams({{q: q, types: types, mode: mode, limit: String(limit)}});
+  if (folders) params.set('folders', folders);
   const es = new EventSource('/stream?' + params.toString());
   const indexingEl = document.getElementById('indexing');
   const resultsEl = document.getElementById('results');
@@ -319,7 +633,8 @@ class Handler(BaseHTTPRequestHandler):
         # Belt-and-suspenders: all assets are inline; deny any external fetch.
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; connect-src 'self'",
         )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
@@ -351,10 +666,84 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_search(parsed)
         elif parsed.path == "/stream":
             self._handle_stream(parsed)
+        elif parsed.path == "/dirs":
+            self._handle_dirs(parsed)
         elif parsed.path == "/open":
             self._handle_open(parsed)
         else:
             self._send(404, "not found")
+
+    # /dirs — JSON, one directory level
+    def _handle_dirs(self, parsed):
+        """Return the immediate subdirectories of the requested path.
+
+        Empty/missing `path` → the configured root folders. Otherwise the
+        path must lie inside one of those roots (lexical check, no symlink
+        following). Results capped at MAX_DIR_CHILDREN; hidden entries
+        skipped. Symlinks to dirs are NOT listed — this is the loop-safety
+        guarantee for the picker: each call descends exactly one real
+        directory level and can never enter a symlink cycle."""
+        qs = urllib.parse.parse_qs(parsed.query)
+        requested = qs.get("path", [""])[0]
+
+        if not requested:
+            children = []
+            seen: set[str] = set()
+            for r in self.cfg["folders"]:
+                norm = _normpath(r)
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                p = Path(norm)
+                if not p.is_dir():
+                    continue
+                children.append({
+                    "name": str(p),
+                    "path": norm,
+                    "has_children": _has_dir_child(p),
+                })
+            payload = json.dumps({"path": "", "children": children})
+            self._send(200, payload, ctype="application/json; charset=utf-8")
+            return
+
+        target = _resolve_within_roots(requested, self.cfg["folders"])
+        if target is None:
+            self._reject(403, "forbidden: path is not within a configured folder")
+            return
+
+        children = []
+        truncated = False
+        try:
+            with os.scandir(target) as it:
+                for entry in it:
+                    if len(children) >= MAX_DIR_CHILDREN:
+                        truncated = True
+                        break
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        # follow_symlinks=False — a symlink to a dir is not
+                        # listed, so the picker cannot enter a loop.
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    cp = Path(entry.path)
+                    children.append({
+                        "name": entry.name,
+                        "path": _normpath(str(cp)),
+                        "has_children": _has_dir_child(cp),
+                    })
+        except OSError as e:
+            self._reject(500, f"could not list directory: {e.__class__.__name__}")
+            return
+        children.sort(key=lambda c: c["name"].lower())
+        payload = json.dumps({
+            "path": str(target),
+            "children": children,
+            "truncated": truncated,
+        })
+        self._send(200, payload, ctype="application/json; charset=utf-8")
 
     # /open
     def _handle_open(self, parsed):
@@ -398,6 +787,10 @@ class Handler(BaseHTTPRequestHandler):
                 type_selection = "all"
             else:
                 type_selection = ",".join(types)
+        folders_raw = qs.get("folders", [""])[0]
+        effective_folders, folders_filtered = _parse_folders_param(
+            folders_raw, self.cfg["folders"]
+        )
         mode = qs.get("mode", [self.cfg.get("mode") or "all"])[0]
         if mode not in ("all", "phrase", "any"):
             mode = "all"
@@ -419,6 +812,11 @@ class Handler(BaseHTTPRequestHandler):
             if type_selection != "all":
                 allowed = {"." + t.lower() for t in types}
                 results = [r for r in results if r[0].suffix.lower() in allowed]
+            if folders_filtered:
+                results = [
+                    r for r in results
+                    if any(_path_under(_normpath(str(r[0])), f) for f in effective_folders)
+                ]
             inline_html, doc_count, hit_count = _render_inline(results, expr, limit)
             body_parts.append(
                 f'<div class="meta"><span id="result-count" '
@@ -431,18 +829,28 @@ class Handler(BaseHTTPRequestHandler):
             stream_script = STREAM_SCRIPT_TPL.format(
                 q_json=json.dumps(q),
                 types_json=json.dumps(",".join(types)),
+                folders_json=json.dumps("\n".join(effective_folders) if folders_filtered else ""),
                 mode_json=json.dumps(mode),
                 limit=limit,
             )
             title = f"{q} — docsearch"
         else:
+            shown = effective_folders if folders_filtered else self.cfg["folders"]
             body_parts.append(
                 '<div class="empty">Type a query above. '
                 "Searching in: <br><br>"
-                + "<br>".join(html.escape(f) for f in self.cfg["folders"])
+                + "<br>".join(html.escape(f) for f in shown)
                 + "</div>"
             )
             title = "docsearch"
+
+        if folders_filtered:
+            summary = "Folders: " + ", ".join(
+                html.escape(os.path.basename(f) or f) for f in effective_folders
+            ) + ' <a href="#" id="folders-reset">(reset)</a>'
+        else:
+            summary = "Folders: all configured"
+        folders_value = "\n".join(effective_folders) if folders_filtered else ""
 
         page = PAGE.format(
             title=html.escape(title),
@@ -451,7 +859,10 @@ class Handler(BaseHTTPRequestHandler):
             mode_all_sel=' selected' if mode == "all" else "",
             mode_phrase_sel=' selected' if mode == "phrase" else "",
             mode_any_sel=' selected' if mode == "any" else "",
+            folders_attr=html.escape(folders_value, quote=True),
+            folders_summary=summary,
             body="\n".join(body_parts),
+            folder_picker_script=FOLDER_PICKER_SCRIPT,
             stream_script=stream_script,
         )
         self._send(200, page)
@@ -465,6 +876,8 @@ class Handler(BaseHTTPRequestHandler):
             types = list(self.cfg["types"])
         else:
             types = [t.strip().lstrip(".") for t in types_str.split(",") if t.strip()] or list(self.cfg["types"])
+        folders_raw = qs.get("folders", [""])[0]
+        effective_folders, _ = _parse_folders_param(folders_raw, self.cfg["folders"])
         mode = qs.get("mode", [self.cfg.get("mode") or "all"])[0]
         if mode not in ("all", "phrase", "any"):
             mode = "all"
@@ -480,7 +893,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            self._stream_loop(q, types, limit, mode)
+            self._stream_loop(q, types, limit, mode, effective_folders)
         except BrokenPipeError:
             return
 
@@ -493,11 +906,19 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return False
 
-    def _stream_loop(self, q: str, types: list[str], limit: int, mode: str = "all"):
+    def _stream_loop(
+        self,
+        q: str,
+        types: list[str],
+        limit: int,
+        mode: str = "all",
+        folders: list[str] | None = None,
+    ):
         # Open a reader DB for walk_unindexed enumeration.
+        walk_folders = folders if folders else self.cfg["folders"]
         db = self._open_db()
         try:
-            pending = list(index.walk_unindexed(db, self.cfg["folders"], types))
+            pending = list(index.walk_unindexed(db, walk_folders, types))
         finally:
             db.close()
 
