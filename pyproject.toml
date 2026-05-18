@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docsearch"
+version = "0.1.0"
+description = "Local full-text search across documents (docx, pdf, doc, rtf, pages, txt, md)."
+requires-python = ">=3.9"
+authors = [{ name = "bg" }]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "reportlab>=4"]
+
+[project.scripts]
+docsearch = "docsearch.cli:main"
+docsearch-web = "docsearch.web:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["docsearch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
