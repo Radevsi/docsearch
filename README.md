@@ -12,13 +12,15 @@ Search across all your documents instantly — `docx`, `pdf`, `doc`, `rtf`, `pag
 
 ### Step 1 — Download
 
-Click the green **Code** button on this page, choose **Download ZIP**, unzip it, and move the `docsearch` folder wherever you like (e.g. your home folder or Desktop).
-
-Or, if you use git:
+Open **Terminal** and run:
 
 ```sh
 git clone https://github.com/Radevsi/docsearch.git
 ```
+
+This puts a `docsearch` folder on your computer. Move it wherever you like (e.g. your home folder or Desktop).
+
+> **Don't have git?** Download it from [git-scm.com](https://git-scm.com/download/mac) — it's free and takes about a minute.
 
 ### Step 2 — Install Python (if you don't have it)
 
@@ -35,7 +37,7 @@ If you see `Python 3.9` or higher you're good. Otherwise, download Python from [
 Open the `docsearch` folder in Finder and double-click **Launch docsearch.command**.
 
 - The first time: Terminal will open, set things up automatically (takes about 30 seconds), and then open docsearch in your browser.
-- Every time after: it opens in a few seconds.
+- Every time after: it checks for updates automatically — if there's a newer version it installs it, then opens in a few seconds.
 
 > **"This cannot be opened"?** Right-click the file → **Open** → **Open** again. You'll only need to do this once.
 
@@ -65,15 +67,7 @@ Your index is saved at `~/.cache/docsearch/index.sqlite` and persists across res
 
 ## Updates
 
-When an update is available, you'll see a notice in the Terminal window when you launch. To update:
-
-```sh
-cd docsearch
-git pull
-pip install -e .
-```
-
-Then relaunch as normal.
+**Nothing to do.** Every time you launch, the launcher checks GitHub for new versions and installs them automatically before opening the app. As long as you cloned via `git clone` (Step 1), you'll always be on the latest version.
 
 ---
 
