@@ -7,6 +7,8 @@ Architecture:
   GET /dirs      → JSON listing of one directory level (lazy folder picker).
   GET /open      → opens a hit file in the system viewer.
 """
+from __future__ import annotations
+
 import hmac
 import html
 import http.cookies
