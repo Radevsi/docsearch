@@ -21,11 +21,13 @@ if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/n
     LOCAL=$(git rev-parse HEAD 2>/dev/null)
     REMOTE=$(git rev-parse origin/main 2>/dev/null)
     if [ -n "$LOCAL" ] && [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
-      echo "-----------------------------------------------------------"
-      echo "  Update available ($(git rev-parse --short HEAD)  ->  $(git rev-parse --short origin/main))"
-      echo "  To update, run in Terminal:"
-      echo "    cd \"$(pwd)\" && git pull && pip install -e ."
-      echo "-----------------------------------------------------------"
+      echo "Update available — installing $(git rev-parse --short HEAD) → $(git rev-parse --short origin/main)…"
+      if git pull --quiet origin main 2>/dev/null; then
+        source .venv/bin/activate 2>/dev/null || true
+        pip install --quiet -e . && echo "Updated. Launching…" || echo "pip install failed — launching existing version."
+      else
+        echo "Update failed (local changes?) — launching existing version."
+      fi
       echo
     fi
   fi
