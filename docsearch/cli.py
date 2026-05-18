@@ -98,8 +98,13 @@ def _cmd_index(args, cfg):
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         for fut in as_completed(ex.submit(work, p) for p in pending):
-            path, status = fut.result()
             done += 1
+            try:
+                path, status = fut.result()
+            except Exception as exc:
+                sys.stderr.write(f"\r  {done}/{total} (error      ) {exc!s:.60}\033[K\n")
+                sys.stderr.flush()
+                continue
             if done % 25 == 0 or done == total:
                 sys.stderr.write(f"\r  {done}/{total} ({status:11s}) {path.name[:60]}\033[K")
                 sys.stderr.flush()

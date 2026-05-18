@@ -817,8 +817,35 @@ class Handler(BaseHTTPRequestHandler):
             db = self._open_db()
             try:
                 results = index.search(db, q, mode=mode)
+                query_error = None
+            except Exception as exc:
+                results = []
+                query_error = str(exc)
             finally:
                 db.close()
+            if query_error:
+                body_parts.append(
+                    f'<div class="empty">Invalid query: '
+                    f'<code>{html.escape(query_error)}</code></div>'
+                )
+                title = "docsearch"
+                page = PAGE.format(
+                    title=html.escape(title),
+                    q_attr=html.escape(q, quote=True),
+                    types_options=self._render_types_options(type_selection),
+                    mode_all_sel=' selected' if mode == "all" else "",
+                    mode_phrase_sel=' selected' if mode == "phrase" else "",
+                    mode_any_sel=' selected' if mode == "any" else "",
+                    folders_attr=html.escape(folders_value, quote=True),
+                    folders_summary=summary,
+                    db_path_attr=html.escape(str(self.db_path or index.default_db_path())),
+                    app_version_attr=html.escape(self.app_version),
+                    body="\n".join(body_parts),
+                    folder_picker_script=FOLDER_PICKER_SCRIPT,
+                    stream_script="",
+                )
+                self._send(200, page)
+                return
             if type_selection != "all":
                 allowed = {"." + t.lower() for t in types}
                 results = [r for r in results if r[0].suffix.lower() in allowed]

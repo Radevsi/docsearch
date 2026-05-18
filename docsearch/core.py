@@ -19,14 +19,23 @@ def extract_docx(path):
     return "\n".join(paras), None
 
 
+_pdftotext_warned = False
+
+
 def extract_pdf(path):
+    global _pdftotext_warned
     try:
         r = subprocess.run(
             ["pdftotext", "-layout", str(path), "-"],
             capture_output=True, text=True, timeout=90,
         )
     except FileNotFoundError:
-        sys.stderr.write("warning: pdftotext not installed (brew install poppler) — skipping PDFs\n")
+        if not _pdftotext_warned:
+            _pdftotext_warned = True
+            sys.stderr.write(
+                "warning: pdftotext not found — PDFs will be skipped. "
+                "Install with: brew install poppler\n"
+            )
         return None, None
     except subprocess.TimeoutExpired:
         return None, None

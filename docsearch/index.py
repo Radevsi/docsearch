@@ -134,7 +134,10 @@ def write_file(
             )
         db.execute("COMMIT")
     except Exception:
-        db.execute("ROLLBACK")
+        try:
+            db.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     return status
 
@@ -199,12 +202,15 @@ def search_one(
     expr = build_match_expr(query, mode)
     if not expr:
         return None
-    row = db.execute(
-        """SELECT d.content, f.page_breaks
-             FROM docs d JOIN files f ON f.path = d.path
-            WHERE d.path = ? AND d.content MATCH ?""",
-        (str(path), expr),
-    ).fetchone()
+    try:
+        row = db.execute(
+            """SELECT d.content, f.page_breaks
+                 FROM docs d JOIN files f ON f.path = d.path
+                WHERE d.path = ? AND d.content MATCH ?""",
+            (str(path), expr),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
     if row is None:
         return None
     content, breaks_blob = row
@@ -228,14 +234,17 @@ def search(
     if not expr:
         return []
 
-    rows = db.execute(
-        """SELECT d.path, d.content, f.page_breaks
-             FROM docs d JOIN files f ON f.path = d.path
-            WHERE d.content MATCH ?
-            ORDER BY bm25(docs)
-            LIMIT ?""",
-        (expr, limit),
-    ).fetchall()
+    try:
+        rows = db.execute(
+            """SELECT d.path, d.content, f.page_breaks
+                 FROM docs d JOIN files f ON f.path = d.path
+                WHERE d.content MATCH ?
+                ORDER BY bm25(docs)
+                LIMIT ?""",
+            (expr, limit),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
 
     out: list[tuple[Path, list[dict]]] = []
     for path_str, content, breaks_blob in rows:
@@ -421,6 +430,10 @@ def walk_unindexed(
 
     Snapshots `files` into memory once so we don't do one SQLite round-trip per
     file (~/Documents trees can be tens of thousands of files).
+
+    Uses os.walk(followlinks=False) so symlinks to directories are never
+    recursed into. This prevents infinite loops from self-referential symlinks
+    (common in Dropbox, iCloud Drive, and similar sync folders).
     """
     exts = {"." + t.lower().lstrip(".") for t in types}
     seen: dict[str, tuple[float, int]] = {
@@ -428,20 +441,24 @@ def walk_unindexed(
         for path, mtime, size in db.execute("SELECT path, mtime, size FROM files")
     }
     for folder in folders:
-        root = Path(os.path.expanduser(folder))
-        if not root.exists():
+        root = Path(os.path.expanduser(str(folder)))
+        if not root.is_dir():
             continue
-        for p in root.rglob("*"):
-            if not p.is_file() or p.suffix.lower() not in exts:
-                continue
-            st = p.stat()
-            prev = seen.get(str(p))
-            if prev is None:
-                yield p
-                continue
-            mtime, size = prev
-            if mtime == st.st_mtime and size == st.st_size:
-                # Already seen with same fingerprint — skip regardless of status
-                # ('ok' = indexed, 'failed' = don't retry, 'unsupported' = won't change)
-                continue
-            yield p
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            # Prune hidden directories in-place so os.walk never descends into
+            # them (e.g. .git, .Trash, hidden sync caches).
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fname in filenames:
+                if not fname.startswith(".") and Path(fname).suffix.lower() in exts:
+                    p = Path(dirpath) / fname
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    prev = seen.get(str(p))
+                    if prev is None:
+                        yield p
+                        continue
+                    mtime, size = prev
+                    if mtime != st.st_mtime or size != st.st_size:
+                        yield p
