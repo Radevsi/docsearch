@@ -237,6 +237,7 @@ PAGE = """<!doctype html>
   Index: <code>{db_path_attr}</code> &mdash; persists across restarts.
   New or changed files are indexed automatically on search.
   PDFs require <code>brew install poppler</code>.
+  &nbsp;&middot;&nbsp; version <code>{app_version_attr}</code>
 </footer>
 </body>
 </html>
@@ -554,6 +555,7 @@ class Handler(BaseHTTPRequestHandler):
     db_path: Path | None = None
     session_token: str | None = None
     bound_port: int | None = None
+    app_version: str = "dev"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[docsearch] " + (fmt % args) + "\n")
@@ -871,6 +873,7 @@ class Handler(BaseHTTPRequestHandler):
             folders_attr=html.escape(folders_value, quote=True),
             folders_summary=summary,
             db_path_attr=html.escape(db_path),
+            app_version_attr=html.escape(self.app_version),
             body="\n".join(body_parts),
             folder_picker_script=FOLDER_PICKER_SCRIPT,
             stream_script=stream_script,
@@ -1014,9 +1017,27 @@ def _write_token_file(token: str) -> Path:
     return path
 
 
+def _git_version() -> str:
+    """Return the short commit hash of HEAD, or 'dev' if git is unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=Path(__file__).resolve().parent,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "dev"
+
+
 def main():
     Handler.cfg = load_config()
     Handler.db_path = index.default_db_path()
+    Handler.app_version = _git_version()
     Handler.session_token = secrets.token_urlsafe(32)
     token_path = _write_token_file(Handler.session_token)
 
@@ -1027,6 +1048,7 @@ def main():
     base = f"http://127.0.0.1:{Handler.bound_port}"
     launch_url = f"{base}/?token={Handler.session_token}"
     print(f"docsearch web UI running at {base}/")
+    print(f"version:    {Handler.app_version}")
     print(f"folders:    {Handler.cfg['folders']}")
     print(f"types:      {Handler.cfg['types']}")
     print(f"db:         {Handler.db_path}")
