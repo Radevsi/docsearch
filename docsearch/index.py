@@ -73,54 +73,91 @@ def _unpack_breaks(blob: bytes | None) -> list[int] | None:
 
 # --- index a single file -----------------------------------------------------
 
+def extract_content(path: Path) -> tuple[float, int, str | None, list[int] | None]:
+    """Stat and extract `path` without touching the database.
+
+    Returns (mtime, size, text, page_breaks). text is None when the format is
+    unsupported or extraction fails. Safe to call concurrently from many
+    threads — no shared mutable state."""
+    path = Path(path)
+    st = path.stat()
+    text, breaks = _extract(path)
+    return st.st_mtime, st.st_size, text, breaks
+
+
+def write_file(
+    db: sqlite3.Connection,
+    path: Path,
+    mtime: float,
+    size: int,
+    text: str | None,
+    breaks: list[int] | None,
+) -> str:
+    """Persist pre-extracted content to the index and return a status string.
+
+    Groups all writes in one BEGIN/COMMIT so a mid-write crash cannot leave
+    the files and docs tables inconsistent. Must be called while the caller
+    holds whatever lock serialises access to `db`."""
+    path = Path(path)
+    # BEGIN IMMEDIATE acquires the write lock upfront so the busy handler
+    # (PRAGMA busy_timeout) fires here — a single statement — rather than
+    # mid-transaction where SQLite does NOT invoke the busy handler.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if text is None:
+            ext = path.suffix.lower().lstrip(".")
+            status = "unsupported" if ext not in core.EXTRACTORS else "failed"
+            db.execute(
+                """INSERT INTO files(path, mtime, size, page_breaks, status, error, indexed_at)
+                     VALUES(?, ?, ?, NULL, ?, NULL, ?)
+                     ON CONFLICT(path) DO UPDATE SET
+                       mtime=excluded.mtime, size=excluded.size,
+                       status=excluded.status, error=NULL,
+                       indexed_at=excluded.indexed_at, page_breaks=NULL""",
+                (str(path), mtime, size, status, time.time()),
+            )
+            db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
+        else:
+            status = "ok"
+            db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
+            db.execute(
+                "INSERT INTO docs(path, content) VALUES(?, ?)", (str(path), text)
+            )
+            db.execute(
+                """INSERT INTO files(path, mtime, size, page_breaks, status, error, indexed_at)
+                     VALUES(?, ?, ?, ?, 'ok', NULL, ?)
+                     ON CONFLICT(path) DO UPDATE SET
+                       mtime=excluded.mtime, size=excluded.size,
+                       page_breaks=excluded.page_breaks, status='ok',
+                       error=NULL, indexed_at=excluded.indexed_at""",
+                (str(path), mtime, size, _pack_breaks(breaks), time.time()),
+            )
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return status
+
+
 def index_file(db: sqlite3.Connection, path: Path) -> str:
     """Extract `path` and upsert it into the index.
+
+    Convenience wrapper used by the CLI and tests. For the streaming web
+    worker, prefer extract_content() + write_file() so extraction can run
+    in parallel while writes are serialised under an external lock.
 
     Returns: 'ok' | 'failed' | 'unsupported' | 'unchanged'.
     """
     path = Path(path)
     st = path.stat()
     mtime, size = st.st_mtime, st.st_size
-
     row = db.execute(
-        "SELECT mtime, size, status FROM files WHERE path = ?", (str(path),)
+        "SELECT mtime, size FROM files WHERE path = ?", (str(path),)
     ).fetchone()
     if row is not None and row[0] == mtime and row[1] == size:
         return "unchanged"
-
-    text, breaks = _extract(path)
-
-    if text is None:
-        # Unsupported extension vs. extraction failure — core.extract returns
-        # (None, None) for both. Distinguish by file suffix.
-        ext = path.suffix.lower().lstrip(".")
-        status = "unsupported" if ext not in core.EXTRACTORS else "failed"
-        db.execute(
-            """INSERT INTO files(path, mtime, size, page_breaks, status, error, indexed_at)
-                 VALUES(?, ?, ?, NULL, ?, NULL, ?)
-                 ON CONFLICT(path) DO UPDATE SET
-                   mtime=excluded.mtime, size=excluded.size,
-                   status=excluded.status, error=NULL, indexed_at=excluded.indexed_at,
-                   page_breaks=NULL""",
-            (str(path), mtime, size, status, time.time()),
-        )
-        # Remove any stale docs row from a previous successful index.
-        db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
-        return status
-
-    # Successful extraction — replace docs row.
-    db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
-    db.execute("INSERT INTO docs(path, content) VALUES(?, ?)", (str(path), text))
-    db.execute(
-        """INSERT INTO files(path, mtime, size, page_breaks, status, error, indexed_at)
-             VALUES(?, ?, ?, ?, 'ok', NULL, ?)
-             ON CONFLICT(path) DO UPDATE SET
-               mtime=excluded.mtime, size=excluded.size,
-               page_breaks=excluded.page_breaks, status='ok',
-               error=NULL, indexed_at=excluded.indexed_at""",
-        (str(path), mtime, size, _pack_breaks(breaks), time.time()),
-    )
-    return "ok"
+    _, _, text, breaks = extract_content(path)
+    return write_file(db, path, mtime, size, text, breaks)
 
 
 # --- search ------------------------------------------------------------------

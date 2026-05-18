@@ -179,6 +179,9 @@ PAGE = """<!doctype html>
   .more {{ color: var(--muted); font-size: 0.85em; padding-left: 14px;
            font-family: -apple-system, sans-serif; }}
   .empty {{ color: var(--muted); padding: 40px 0; text-align: center; font-size: 1.05em; }}
+  footer {{ margin-top: 48px; padding-top: 12px; border-top: 1px solid var(--rule);
+            color: var(--muted); font-size: 0.8em; font-family: -apple-system, sans-serif; }}
+  footer code {{ font-size: 0.95em; }}
   .folder-summary {{ color: var(--muted); font-size: 0.85em; margin-top: 8px;
                      font-family: -apple-system, sans-serif; }}
   .folder-summary a {{ color: var(--link); }}
@@ -230,6 +233,11 @@ PAGE = """<!doctype html>
 {body}
 {folder_picker_script}
 {stream_script}
+<footer>
+  Index: <code>{db_path_attr}</code> &mdash; persists across restarts.
+  New or changed files are indexed automatically on search.
+  PDFs require <code>brew install poppler</code>.
+</footer>
 </body>
 </html>
 """
@@ -852,6 +860,7 @@ class Handler(BaseHTTPRequestHandler):
             summary = "Folders: all configured"
         folders_value = "\n".join(effective_folders) if folders_filtered else ""
 
+        db_path = str(self.db_path or index.default_db_path())
         page = PAGE.format(
             title=html.escape(title),
             q_attr=html.escape(q, quote=True),
@@ -861,6 +870,7 @@ class Handler(BaseHTTPRequestHandler):
             mode_any_sel=' selected' if mode == "any" else "",
             folders_attr=html.escape(folders_value, quote=True),
             folders_summary=summary,
+            db_path_attr=html.escape(db_path),
             body="\n".join(body_parts),
             folder_picker_script=FOLDER_PICKER_SCRIPT,
             stream_script=stream_script,
@@ -932,18 +942,33 @@ class Handler(BaseHTTPRequestHandler):
         expr = index.build_match_expr(q, mode)
         done = 0
         done_lock = threading.Lock()
-        send_lock = threading.Lock()  # serialize writes to wfile
+        send_lock = threading.Lock()  # serialise SSE writes to wfile
+        # Single shared write connection + lock so concurrent extract threads
+        # never contend for the DB write lock (the root cause of the
+        # "database is locked" OperationalError under ThreadPoolExecutor).
+        write_db = self._open_db()
+        write_lock = threading.Lock()
 
         def worker(path: Path):
             nonlocal done
-            wdb = self._open_db()
+            # Extraction is the slow step (pdftotext, textutil). Run it
+            # without any lock so all four threads can work in parallel.
             try:
-                status = index.index_file(wdb, path)
-                snippets = None
-                if status == "ok":
-                    snippets = index.search_one(wdb, q, path, mode=mode)
-            finally:
-                wdb.close()
+                mtime, size, text, breaks = index.extract_content(path)
+            except OSError:
+                mtime = size = 0
+                text = breaks = None
+
+            # DB writes and the subsequent FTS5 search are fast; serialise
+            # them through the single shared connection to eliminate contention.
+            snippets = None
+            with write_lock:
+                try:
+                    index.write_file(write_db, path, mtime, size, text, breaks)
+                    if text is not None:
+                        snippets = index.search_one(write_db, q, path, mode=mode)
+                except Exception as exc:
+                    sys.stderr.write(f"[docsearch] error indexing {path}: {exc}\n")
 
             with done_lock:
                 done += 1
@@ -959,8 +984,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._emit("progress", {"total": total, "done": d})
 
         # Bounded thread pool; pdftotext is the slow part.
-        with ThreadPoolExecutor(max_workers=MAX_EXTRACTORS) as ex:
-            list(ex.map(worker, pending))
+        try:
+            with ThreadPoolExecutor(max_workers=MAX_EXTRACTORS) as ex:
+                list(ex.map(worker, pending))
+        finally:
+            write_db.close()
 
         self._emit("done", {"total": total})
 
