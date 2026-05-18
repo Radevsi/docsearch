@@ -98,7 +98,9 @@ PAGE = """<!doctype html>
       <option value="phrase"{mode_phrase_sel}>exact phrase</option>
       <option value="any"{mode_any_sel}>any word</option>
     </select>
-    <input type="hidden" name="types" value="{types_attr}">
+    <select name="types" aria-label="File type">
+      {types_options}
+    </select>
     <button type="submit">Search</button>
   </form>
 </header>
@@ -364,12 +366,38 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "not found")
 
+    def _render_types_options(self, selection: str) -> str:
+        """Build <option> tags for the file-type dropdown.
+
+        `selection` is either 'all' or a comma-joined list of types matching
+        one of the configured single-type options."""
+        opts = ['<option value="all"{sel}>all types</option>'.format(
+            sel=" selected" if selection == "all" else ""
+        )]
+        for t in self.cfg["types"]:
+            sel = " selected" if selection == t else ""
+            opts.append(
+                f'<option value="{html.escape(t, quote=True)}"{sel}>'
+                f'{html.escape(t)} only</option>'
+            )
+        return "\n      ".join(opts)
+
     # /
     def _handle_search(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
         q = qs.get("q", [""])[0]
-        types_str = qs.get("types", [",".join(self.cfg["types"])])[0]
-        types = [t.strip().lstrip(".") for t in types_str.split(",") if t.strip()] or self.cfg["types"]
+        types_str = qs.get("types", [""])[0]
+        if types_str.strip().lower() in ("", "all"):
+            types_str = ""
+            types = list(self.cfg["types"])
+            type_selection = "all"
+        else:
+            types = [t.strip().lstrip(".") for t in types_str.split(",") if t.strip()]
+            if not types:
+                types = list(self.cfg["types"])
+                type_selection = "all"
+            else:
+                type_selection = ",".join(types)
         mode = qs.get("mode", [self.cfg.get("mode") or "all"])[0]
         if mode not in ("all", "phrase", "any"):
             mode = "all"
@@ -388,6 +416,9 @@ class Handler(BaseHTTPRequestHandler):
                 results = index.search(db, q, mode=mode)
             finally:
                 db.close()
+            if type_selection != "all":
+                allowed = {"." + t.lower() for t in types}
+                results = [r for r in results if r[0].suffix.lower() in allowed]
             inline_html, doc_count, hit_count = _render_inline(results, expr, limit)
             body_parts.append(
                 f'<div class="meta"><span id="result-count" '
@@ -416,7 +447,7 @@ class Handler(BaseHTTPRequestHandler):
         page = PAGE.format(
             title=html.escape(title),
             q_attr=html.escape(q, quote=True),
-            types_attr=html.escape(types_str, quote=True),
+            types_options=self._render_types_options(type_selection),
             mode_all_sel=' selected' if mode == "all" else "",
             mode_phrase_sel=' selected' if mode == "phrase" else "",
             mode_any_sel=' selected' if mode == "any" else "",
@@ -429,8 +460,11 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_stream(self, parsed):
         qs = urllib.parse.parse_qs(parsed.query)
         q = qs.get("q", [""])[0]
-        types_str = qs.get("types", [",".join(self.cfg["types"])])[0]
-        types = [t.strip().lstrip(".") for t in types_str.split(",") if t.strip()] or self.cfg["types"]
+        types_str = qs.get("types", [""])[0]
+        if types_str.strip().lower() in ("", "all"):
+            types = list(self.cfg["types"])
+        else:
+            types = [t.strip().lstrip(".") for t in types_str.split(",") if t.strip()] or list(self.cfg["types"])
         mode = qs.get("mode", [self.cfg.get("mode") or "all"])[0]
         if mode not in ("all", "phrase", "any"):
             mode = "all"
