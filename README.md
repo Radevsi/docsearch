@@ -43,13 +43,33 @@ Open the `docsearch` folder in Finder and double-click **Launch docsearch.comman
 
 ---
 
-## Optional: PDF support
+## Optional add-ons
 
-PDFs are supported but require a free tool called Poppler. If you want to search inside PDFs, install [Homebrew](https://brew.sh) first, then run in Terminal:
+All of these require [Homebrew](https://brew.sh). Install it first if you don't have it.
+
+### PDF support (text-based PDFs)
 
 ```sh
 brew install poppler
 ```
+
+Required to search inside PDFs. Without it, PDF files are skipped entirely.
+
+### Scanned PDF support (OCR)
+
+```sh
+brew install ocrmypdf
+```
+
+Enables searching inside scanned PDFs (e.g. photocopied documents). Without it, scanned PDFs are detected but not indexed. OCR runs automatically in the background — re-search after a few minutes to see results.
+
+### Greek language OCR
+
+```sh
+brew install tesseract-lang
+```
+
+Required if you want to OCR scanned PDFs that contain Greek text. Without it, OCR defaults to English only and will misread Greek characters. Install this alongside `ocrmypdf`.
 
 ---
 
