@@ -257,6 +257,11 @@ FOLDER_PICKER_SCRIPT = """
   const clearBtn = document.getElementById('folders-clear');
   const closeBtn = document.getElementById('folders-close');
   const resetLink = document.getElementById('folders-reset');
+  // Track the active selection so newly-created nodes can be pre-checked.
+  // Updated on every Apply so re-opening the picker reflects the last submit.
+  let activeSelection = new Set(
+    (input.value || '').split('\\n').map(s => s.trim()).filter(Boolean)
+  );
   if (!btn || !panel || !tree || !input || !form) return;
 
   let loaded = false;
@@ -294,6 +299,13 @@ FOLDER_PICKER_SCRIPT = """
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.className = 'tree-check';
+    // Pre-check if this path (or an ancestor of it) is in the active selection.
+    if (activeSelection.size > 0) {
+      const sep = '/';
+      checkbox.checked = [...activeSelection].some(
+        s => child.path === s || child.path.startsWith(s + sep)
+      );
+    }
 
     const label = document.createElement('span');
     label.className = 'tree-label';
@@ -416,10 +428,12 @@ FOLDER_PICKER_SCRIPT = """
   applyBtn.addEventListener('click', () => {
     const kept = collectChecked();
     input.value = kept.join('\\n');
+    activeSelection = new Set(kept);
     form.submit();
   });
   clearBtn.addEventListener('click', () => {
     input.value = '';
+    activeSelection = new Set();
     form.submit();
   });
   if (resetLink) {
