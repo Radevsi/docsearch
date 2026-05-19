@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS files (
     page_breaks BLOB,
     status      TEXT NOT NULL,
     error       TEXT,
-    indexed_at  REAL NOT NULL
+    indexed_at  REAL NOT NULL,
+    content_raw TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
@@ -53,7 +54,40 @@ def open_db(path) -> sqlite3.Connection:
     db.execute("PRAGMA synchronous = NORMAL")
     db.execute("PRAGMA busy_timeout = 5000")
     db.executescript(SCHEMA)
+    _migrate(db)
     return db
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """One-time migrations applied to existing databases.
+
+    v1: add content_raw column and reset the FTS5 index so text is stored
+        pre-folded (diacritics stripped). This makes Greek/accented search
+        work correctly. Existing indexed files are reset to 'failed' so they
+        are re-indexed automatically on the next search."""
+    has_raw = db.execute(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='content_raw'"
+    ).fetchone()[0]
+    if has_raw:
+        return
+    import sys as _sys
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("ALTER TABLE files ADD COLUMN content_raw TEXT")
+        db.execute("DELETE FROM docs")
+        db.execute(
+            "UPDATE files SET status='failed' WHERE status IN ('ok','ocr_failed')"
+        )
+        db.execute("COMMIT")
+        _sys.stderr.write(
+            "[docsearch] Index migrated for Unicode/Greek diacritic support. "
+            "Files will be re-indexed on the next search.\n"
+        )
+    except Exception:
+        try:
+            db.execute("ROLLBACK")
+        except Exception:
+            pass
 
 
 # --- page-break encoding -----------------------------------------------------
@@ -134,18 +168,24 @@ def write_file(
             db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
         else:
             status = "ok"
+            # Store diacritic-stripped text in FTS5 so queries match regardless
+            # of accents (Greek, French, etc.). The original text is kept in
+            # files.content_raw so snippets still show the accented form.
+            folded_text, _ = _fold(text)
             db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
             db.execute(
-                "INSERT INTO docs(path, content) VALUES(?, ?)", (str(path), text)
+                "INSERT INTO docs(path, content) VALUES(?, ?)", (str(path), folded_text)
             )
             db.execute(
-                """INSERT INTO files(path, mtime, size, page_breaks, status, error, indexed_at)
-                     VALUES(?, ?, ?, ?, 'ok', NULL, ?)
+                """INSERT INTO files(path, mtime, size, page_breaks, status, error,
+                                    indexed_at, content_raw)
+                     VALUES(?, ?, ?, ?, 'ok', NULL, ?, ?)
                      ON CONFLICT(path) DO UPDATE SET
                        mtime=excluded.mtime, size=excluded.size,
                        page_breaks=excluded.page_breaks, status='ok',
-                       error=NULL, indexed_at=excluded.indexed_at""",
-                (str(path), mtime, size, _pack_breaks(breaks), time.time()),
+                       error=NULL, indexed_at=excluded.indexed_at,
+                       content_raw=excluded.content_raw""",
+                (str(path), mtime, size, _pack_breaks(breaks), time.time(), text),
             )
         db.execute("COMMIT")
     except Exception:
@@ -219,7 +259,7 @@ def search_one(
         return None
     try:
         row = db.execute(
-            """SELECT d.content, f.page_breaks
+            """SELECT COALESCE(f.content_raw, d.content), f.page_breaks
                  FROM docs d JOIN files f ON f.path = d.path
                 WHERE d.path = ? AND d.content MATCH ?""",
             (str(path), expr),
@@ -251,7 +291,7 @@ def search(
 
     try:
         rows = db.execute(
-            """SELECT d.path, d.content, f.page_breaks
+            """SELECT d.path, COALESCE(f.content_raw, d.content), f.page_breaks
                  FROM docs d JOIN files f ON f.path = d.path
                 WHERE d.content MATCH ?
                 ORDER BY bm25(docs)
@@ -423,6 +463,12 @@ def build_match_expr(query: str, mode: str = "all") -> str:
         return raw
 
     tokens = re.findall(r"\w+", raw, flags=re.UNICODE)
+    if not tokens:
+        return ""
+    # Fold tokens (lowercase + strip diacritics) so queries match the pre-folded
+    # content stored in FTS5 — e.g. "φιλοσοφία" → "φιλοσοφια".
+    tokens = [_fold(t)[0] for t in tokens]
+    tokens = [t for t in tokens if t]
     if not tokens:
         return ""
 
