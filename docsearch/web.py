@@ -181,6 +181,8 @@ PAGE = """<!doctype html>
   .more {{ color: var(--muted); font-size: 0.85em; padding-left: 14px;
            font-family: -apple-system, sans-serif; }}
   .empty {{ color: var(--muted); padding: 40px 0; text-align: center; font-size: 1.05em; }}
+  .ocr-notice {{ background: #fff8e1; border: 1px solid #ffe082; border-radius: 3px;
+                 padding: 10px 14px; margin: 12px 0; font-size: 0.9em; color: #555; }}
   footer {{ margin-top: 48px; padding-top: 12px; border-top: 1px solid var(--rule);
             color: var(--muted); font-size: 0.8em; font-family: -apple-system, sans-serif; }}
   footer code {{ font-size: 0.95em; }}
@@ -482,6 +484,15 @@ STREAM_SCRIPT_TPL = """
     countEl.dataset.hits = hitCount;
     countEl.textContent = docCount + ' document(s), ' + hitCount + ' match(es)';
     resultsEl.insertAdjacentHTML('beforeend', r.html);
+  }});
+  es.addEventListener('ocr_queued', (e) => {{
+    const d = JSON.parse(e.data);
+    const n = d.count;
+    const ocrEl = document.getElementById('ocr-notice');
+    if (ocrEl) {{
+      ocrEl.style.display = '';
+      ocrEl.textContent = `⏳ ${{n}} scanned PDF${{n !== 1 ? 's' : ''}} detected — running OCR in the background (this may take several minutes). Re-search when done to include them.`;
+    }}
   }});
   es.addEventListener('done', (e) => {{
     indexingEl.style.display = 'none';
@@ -877,6 +888,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"{doc_count} document(s), {hit_count} match(es)</span></div>"
             )
             body_parts.append('<div class="indexing" id="indexing" style="display:none"></div>')
+            body_parts.append('<div class="ocr-notice" id="ocr-notice" style="display:none"></div>')
             body_parts.append(f'<div id="results">{inline_html}</div>')
 
             stream_script = STREAM_SCRIPT_TPL.format(
@@ -1036,7 +1048,42 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             write_db.close()
 
+        # Check for scanned PDFs that need OCR (separate slow path).
+        ocr_db = self._open_db()
+        try:
+            ocr_pending = index.walk_ocr_pending(ocr_db)
+        finally:
+            ocr_db.close()
+
+        if ocr_pending:
+            self._emit("ocr_queued", {"count": len(ocr_pending)})
+            db_path = self.db_path or index.default_db_path()
+            threading.Thread(
+                target=_ocr_worker,
+                args=(db_path, ocr_pending),
+                daemon=True,
+            ).start()
+
         self._emit("done", {"total": total})
+
+
+def _ocr_worker(db_path: Path, paths: list[Path]) -> None:
+    """Background thread: OCR scanned PDFs one at a time and update the index.
+
+    Each file is marked 'ocr_running' before OCR starts so that if the process
+    crashes mid-OCR, walk_ocr_pending resets it to 'ocr_pending' on the next
+    search and retries it. Results are written via the normal write_file path
+    so the index is always consistent."""
+    ocr_db = index.open_db(db_path)
+    try:
+        for path in paths:
+            try:
+                status = index.run_ocr_file(ocr_db, path)
+                sys.stderr.write(f"[docsearch] OCR {path.name}: {status}\n")
+            except Exception as exc:
+                sys.stderr.write(f"[docsearch] OCR error {path.name}: {exc}\n")
+    finally:
+        ocr_db.close()
 
 
 def _write_token_file(token: str) -> Path:

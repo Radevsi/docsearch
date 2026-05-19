@@ -117,6 +117,21 @@ def write_file(
                 (str(path), mtime, size, status, time.time()),
             )
             db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
+        elif (path.suffix.lower() == ".pdf"
+              and len(text.strip()) < core.OCR_TEXT_THRESHOLD):
+            # pdftotext ran but returned almost no text — likely a scanned PDF.
+            # Queue for OCR rather than storing empty/useless content.
+            status = "ocr_pending"
+            db.execute(
+                """INSERT INTO files(path, mtime, size, page_breaks, status, error, indexed_at)
+                     VALUES(?, ?, ?, NULL, 'ocr_pending', NULL, ?)
+                     ON CONFLICT(path) DO UPDATE SET
+                       mtime=excluded.mtime, size=excluded.size,
+                       status='ocr_pending', error=NULL,
+                       indexed_at=excluded.indexed_at, page_breaks=NULL""",
+                (str(path), mtime, size, time.time()),
+            )
+            db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
         else:
             status = "ok"
             db.execute("DELETE FROM docs WHERE path = ?", (str(path),))
@@ -436,15 +451,15 @@ def walk_unindexed(
     (common in Dropbox, iCloud Drive, and similar sync folders).
     """
     exts = {"." + t.lower().lstrip(".") for t in types}
-    # Only skip files that succeeded or are genuinely unsupported. Files with
-    # status='failed' are always retried — a previous failure may have been due
-    # to a missing tool (e.g. pdftotext not yet installed).
+    # Skip files that are already handled. 'failed' is always retried (tool may
+    # now be installed). OCR statuses are managed by walk_ocr_pending separately
+    # and must not be re-queued for pdftotext extraction.
     seen: dict[str, tuple[float, int]] = {
         path: (mtime, size)
         for path, mtime, size, status in db.execute(
             "SELECT path, mtime, size, status FROM files"
         )
-        if status in ("ok", "unsupported")
+        if status in ("ok", "unsupported", "ocr_pending", "ocr_running", "ocr_failed")
     }
     for folder in folders:
         root = Path(os.path.expanduser(str(folder)))
@@ -468,3 +483,70 @@ def walk_unindexed(
                     mtime, size = prev
                     if mtime != st.st_mtime or size != st.st_size:
                         yield p
+
+
+def walk_ocr_pending(db: sqlite3.Connection) -> list[Path]:
+    """Return paths of scanned PDFs that need OCR.
+
+    Also resets any stale 'ocr_running' entries back to 'ocr_pending' so a
+    process crash never permanently loses a file — it will be retried on the
+    next search."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute(
+            "UPDATE files SET status='ocr_pending' WHERE status='ocr_running'"
+        )
+        db.execute("COMMIT")
+    except Exception:
+        try:
+            db.execute("ROLLBACK")
+        except Exception:
+            pass
+    rows = db.execute(
+        "SELECT path FROM files WHERE status='ocr_pending'"
+    ).fetchall()
+    return [Path(r[0]) for r in rows if Path(r[0]).exists()]
+
+
+def run_ocr_file(db: sqlite3.Connection, path: Path) -> str:
+    """OCR a single scanned PDF and write the result to the index.
+
+    Marks the file as 'ocr_running' before starting (crash recovery: the next
+    walk_ocr_pending resets 'ocr_running' → 'ocr_pending'). Returns a status
+    string: 'ok', 'ocr_failed', or 'error'."""
+    # Mark as in-progress so a crash mid-OCR leaves a recoverable state.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute(
+            "UPDATE files SET status='ocr_running' WHERE path=?", (str(path),)
+        )
+        db.execute("COMMIT")
+    except Exception:
+        try:
+            db.execute("ROLLBACK")
+        except Exception:
+            pass
+        return "error"
+
+    text, breaks = core.extract_pdf_ocr(path)
+
+    if text and text.strip():
+        try:
+            st = path.stat()
+            write_file(db, path, st.st_mtime, st.st_size, text, breaks)
+            return "ok"
+        except Exception:
+            return "error"
+    else:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute(
+                "UPDATE files SET status='ocr_failed' WHERE path=?", (str(path),)
+            )
+            db.execute("COMMIT")
+        except Exception:
+            try:
+                db.execute("ROLLBACK")
+            except Exception:
+                pass
+        return "ocr_failed"

@@ -27,6 +27,11 @@ def extract_docx(path):
 
 
 _pdftotext_warned = False
+_ocr_warned = False
+
+# Minimum non-whitespace characters returned by pdftotext before we decide the
+# PDF has real embedded text. Below this threshold we assume it's scanned.
+OCR_TEXT_THRESHOLD = 50
 
 
 def extract_pdf(path):
@@ -51,6 +56,58 @@ def extract_pdf(path):
     text = r.stdout
     breaks = [0] + [i + 1 for i, ch in enumerate(text) if ch == "\f"]
     return text, breaks
+
+
+def extract_pdf_ocr(path):
+    """OCR fallback for scanned PDFs using ocrmypdf + pdftotext.
+
+    ocrmypdf runs Tesseract on each page image and writes a searchable PDF to
+    a temp file; pdftotext then extracts the text. Both tools must be installed:
+      brew install ocrmypdf   (pulls in tesseract and ghostscript)
+      brew install poppler    (for pdftotext — likely already present)
+
+    Returns (text, page_breaks) or (None, None) if OCR fails or tool is absent.
+    Deliberately has a long timeout (10 min) — scanned PDFs are slow."""
+    global _ocr_warned
+    import os as _os
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    _os.close(tmp_fd)
+    try:
+        try:
+            r = subprocess.run(
+                ["ocrmypdf", "--force-ocr", "--jobs", "1", "--quiet",
+                 str(path), tmp_path],
+                capture_output=True, timeout=600,
+            )
+        except FileNotFoundError:
+            if not _ocr_warned:
+                _ocr_warned = True
+                sys.stderr.write(
+                    "warning: ocrmypdf not found — scanned PDFs cannot be OCR'd. "
+                    "Install with: brew install ocrmypdf\n"
+                )
+            return None, None
+        except subprocess.TimeoutExpired:
+            return None, None
+        if r.returncode != 0:
+            return None, None
+        r2 = subprocess.run(
+            ["pdftotext", "-layout", tmp_path, "-"],
+            capture_output=True, text=True, timeout=90,
+        )
+        if r2.returncode != 0 or not r2.stdout.strip():
+            return None, None
+        text = r2.stdout
+        breaks = [0] + [i + 1 for i, ch in enumerate(text) if ch == "\f"]
+        return text, breaks
+    except Exception:
+        return None, None
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def extract_textutil(path):
