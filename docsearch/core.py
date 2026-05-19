@@ -7,15 +7,22 @@ from xml.etree import ElementTree as ET
 
 
 def extract_docx(path):
+    ns_t = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"
+    ns_p = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
     try:
         with zipfile.ZipFile(path) as z, z.open("word/document.xml") as f:
-            tree = ET.parse(f)
+            paras: list[str] = []
+            current: list[str] = []
+            for event, elem in ET.iterparse(f, events=("end",)):
+                if elem.tag == ns_t:
+                    current.append(elem.text or "")
+                    elem.clear()
+                elif elem.tag == ns_p:
+                    paras.append("".join(current))
+                    current = []
+                    elem.clear()
     except Exception:
         return None, None
-    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    paras = []
-    for p in tree.iter(ns + "p"):
-        paras.append("".join(t.text or "" for t in p.iter(ns + "t")))
     return "\n".join(paras), None
 
 
