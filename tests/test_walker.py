@@ -48,14 +48,16 @@ def test_walk_unindexed_respects_type_filter(tmp_db, corpus):
     assert ".md" not in found
 
 
-def test_walk_unindexed_skips_failed_unchanged(tmp_db, corpus):
-    """A file recorded as failed (e.g. corrupt PDF) is not re-yielded
-    unless its mtime/size changes."""
+def test_walk_unindexed_retries_failed_files(tmp_db, corpus):
+    """A file recorded as 'failed' must always be retried, even if mtime/size
+    is unchanged. A previous failure may have been caused by a missing tool
+    (e.g. pdftotext not installed yet); retrying after the tool is installed
+    should succeed without touching the file."""
     db = index.open_db(tmp_db)
     assert index.index_file(db, corpus / "corrupt.pdf") == "failed"
 
     found = {p.name for p in index.walk_unindexed(db, [corpus], ["pdf"])}
-    assert "corrupt.pdf" not in found
+    assert "corrupt.pdf" in found
 
 
 def test_walk_unindexed_unicode_paths(tmp_db, corpus):

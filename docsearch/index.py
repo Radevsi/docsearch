@@ -436,9 +436,15 @@ def walk_unindexed(
     (common in Dropbox, iCloud Drive, and similar sync folders).
     """
     exts = {"." + t.lower().lstrip(".") for t in types}
+    # Only skip files that succeeded or are genuinely unsupported. Files with
+    # status='failed' are always retried — a previous failure may have been due
+    # to a missing tool (e.g. pdftotext not yet installed).
     seen: dict[str, tuple[float, int]] = {
         path: (mtime, size)
-        for path, mtime, size in db.execute("SELECT path, mtime, size FROM files")
+        for path, mtime, size, status in db.execute(
+            "SELECT path, mtime, size, status FROM files"
+        )
+        if status in ("ok", "unsupported")
     }
     for folder in folders:
         root = Path(os.path.expanduser(str(folder)))
